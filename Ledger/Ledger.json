@@ -1,0 +1,18 @@
+{
+  "Author": "Eauldane",
+  "Name": "Ledger",
+  "Punchline": "Scratch that completionist itch.",
+  "Description": "Shows collection progress for achievements, titles, mounts, minions, orchestrion rolls, and more.",
+  "InternalName": "Ledger",
+  "ApplicableVersion": "any",
+  "LoadPriority": 0,
+  "IconUrl": "https://eauldane.com/logos/ledger.png",
+  "RepoUrl": "https://github.com/Eauldane/Ledger",
+  "Tags": [
+    "collection",
+    "achievements",
+    "minions",
+    "titles",
+    "triple triad"
+  ]
+}
