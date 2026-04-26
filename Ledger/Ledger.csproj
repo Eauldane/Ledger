@@ -1,11 +1,10 @@
 <Project Sdk="Dalamud.NET.Sdk/14.0.2">
   <PropertyGroup>
     <AssemblyName>Ledger</AssemblyName>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <PackageProjectUrl>https://github.com/Eauldane/Ledger/</PackageProjectUrl>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <Use_DalamudPackager>false</Use_DalamudPackager>
-    <Use_Dalamud_ImGui>true</Use_Dalamud_ImGui>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,5 +25,6 @@
 
   <ItemGroup>
     <PackageReference Update="DotNet.ReproducibleBuilds" Version="2.0.2" />
+    <PackageReference Include="ElezenTools" Version="14.0.5" />
   </ItemGroup>
 </Project>

@@ -27,5 +27,16 @@ public sealed class ConfigService
             config.ExcludeLimitedFromAttainable = true;
             config.Version = 2;
         }
+
+        if (config.Version < 3)
+        {
+            config.EnableServerComparison = false;
+            if (string.IsNullOrWhiteSpace(config.ServerBaseUrl))
+            {
+                config.ServerBaseUrl = "http://localhost:5000";
+            }
+
+            config.Version = 3;
+        }
     }
 }

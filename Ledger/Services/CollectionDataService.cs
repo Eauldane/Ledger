@@ -35,6 +35,7 @@ public sealed class CollectionDataService
     private readonly IReadOnlyDictionary<uint, OrnamentTransient> _fashionAccessoryDetails;
     private readonly IReadOnlyList<Glasses> _facewear;
     private readonly IReadOnlyDictionary<uint, GlassesStyle> _facewearStyles;
+    private readonly object _cacheSync = new();
     private readonly Dictionary<CollectionKind, CollectionSnapshot> _snapshotCache = new();
     private AttainableSettings _cachedSettings;
     private DateTime _cacheExpiresUtc;
@@ -65,41 +66,47 @@ public sealed class CollectionDataService
 
     public void Invalidate()
     {
-        _snapshotCache.Clear();
-        _cacheExpiresUtc = DateTime.MinValue;
+        lock (_cacheSync)
+        {
+            _snapshotCache.Clear();
+            _cacheExpiresUtc = DateTime.MinValue;
+        }
     }
 
     public CollectionSnapshot GetSnapshot(CollectionKind kind)
     {
-        var now = DateTime.UtcNow;
-        var settings = GetAttainableSettings();
-        if (now >= _cacheExpiresUtc || settings != _cachedSettings)
+        lock (_cacheSync)
         {
-            _snapshotCache.Clear();
-            _cachedSettings = settings;
-            _cacheExpiresUtc = now + CacheDuration;
-        }
+            var now = DateTime.UtcNow;
+            var settings = GetAttainableSettings();
+            if (now >= _cacheExpiresUtc || settings != _cachedSettings)
+            {
+                _snapshotCache.Clear();
+                _cachedSettings = settings;
+                _cacheExpiresUtc = now + CacheDuration;
+            }
 
-        if (_snapshotCache.TryGetValue(kind, out var snapshot))
-        {
+            if (_snapshotCache.TryGetValue(kind, out var snapshot))
+            {
+                return snapshot;
+            }
+
+            snapshot = kind switch
+            {
+                CollectionKind.Achievements => BuildAchievementSnapshot(),
+                CollectionKind.Minions => BuildMinionSnapshot(),
+                CollectionKind.Titles => BuildTitleSnapshot(),
+                CollectionKind.TripleTriadCards => BuildTripleTriadCardSnapshot(),
+                CollectionKind.Mounts => BuildMountSnapshot(),
+                CollectionKind.OrchestrionRolls => BuildOrchestrionSnapshot(),
+                CollectionKind.FashionAccessories => BuildFashionAccessorySnapshot(),
+                CollectionKind.Facewear => BuildFacewearSnapshot(),
+                _ => new CollectionSnapshot(kind, false, "Unknown collection type.", []),
+            };
+
+            _snapshotCache[kind] = snapshot;
             return snapshot;
         }
-
-        snapshot = kind switch
-        {
-            CollectionKind.Achievements => BuildAchievementSnapshot(),
-            CollectionKind.Minions => BuildMinionSnapshot(),
-            CollectionKind.Titles => BuildTitleSnapshot(),
-            CollectionKind.TripleTriadCards => BuildTripleTriadCardSnapshot(),
-            CollectionKind.Mounts => BuildMountSnapshot(),
-            CollectionKind.OrchestrionRolls => BuildOrchestrionSnapshot(),
-            CollectionKind.FashionAccessories => BuildFashionAccessorySnapshot(),
-            CollectionKind.Facewear => BuildFacewearSnapshot(),
-            _ => new CollectionSnapshot(kind, false, "Unknown collection type.", []),
-        };
-
-        _snapshotCache[kind] = snapshot;
-        return snapshot;
     }
 
     private CollectionSnapshot BuildAchievementSnapshot()
