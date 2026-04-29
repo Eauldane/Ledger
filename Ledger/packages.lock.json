@@ -4,9 +4,9 @@
     "net10.0-windows7.0": {
       "DalamudPackager": {
         "type": "Direct",
-        "requested": "[14.0.2, )",
-        "resolved": "14.0.2",
-        "contentHash": "dQJeq+8eyHzra4Cg5eZ/3LAeS3/UpvvLriYJGSncMK9LqJ7Q4B6jwcOsxo3PfxVd15xj+IzVFxkPqIBmPQu8/w=="
+        "requested": "[15.0.0, )",
+        "resolved": "15.0.0",
+        "contentHash": "411vwC8/X8Z/sQ2TI6v3SvOn66xFPeOjFn3Zn+h0d3Ox2t1kFm66AhDvmx/qcMwVrR+Hidxj0dadpQ2dgyXMBQ=="
       },
       "DotNet.ReproducibleBuilds": {
         "type": "Direct",
@@ -16,9 +16,9 @@
       },
       "ElezenTools": {
         "type": "Direct",
-        "requested": "[14.0.5, )",
-        "resolved": "14.0.5",
-        "contentHash": "huF2f9OxF75fAuQVtv8ZMK5mpGkY3K+iV7Gm8vbK9Y/tqaPOMWc15C3R27rvSMCVRBlyZA6xYtGtaeaTSk+BMg=="
+        "requested": "[15.0.1, )",
+        "resolved": "15.0.1",
+        "contentHash": "dZLjp/pPIsus9TRSyayN4uI/x///rC4NnOdG+H0t1VAFvOHtqqNihYFqweyaxFR2myPD9N0SX0ANbLL1ivIpdQ=="
       }
     },
     "net10.0-windows7.0/win-x64": {}

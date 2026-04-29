@@ -33,10 +33,23 @@ public sealed class ConfigService
             config.EnableServerComparison = false;
             if (string.IsNullOrWhiteSpace(config.ServerBaseUrl))
             {
-                config.ServerBaseUrl = "http://localhost:5000";
+                config.ServerBaseUrl = LedgerServerDefaults.BaseUrl;
             }
 
             config.Version = 3;
+        }
+
+        if (config.Version < 4)
+        {
+            config.ServerBaseUrl = LedgerServerDefaults.BaseUrl;
+            config.Version = 4;
+        }
+
+        if (config.Version < 5)
+        {
+            config.MissingOnly = true;
+            config.ShowExcluded = false;
+            config.Version = 5;
         }
     }
 }

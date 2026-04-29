@@ -6,7 +6,6 @@ namespace Ledger.Models;
 public sealed record SyncPlayerRequest
 {
     public string Ident { get; init; } = string.Empty;
-    public string? CharacterName { get; init; }
     public int HomeWorldId { get; init; }
     public int DatacenterId { get; init; }
     public int RegionId { get; init; }

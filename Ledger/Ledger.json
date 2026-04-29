@@ -5,6 +5,7 @@
   "Description": "Shows collection progress for achievements, titles, mounts, minions, orchestrion rolls, and more.",
   "InternalName": "Ledger",
   "ApplicableVersion": "any",
+  "DalamudApiLevel": 15,
   "LoadPriority": 0,
   "IconUrl": "https://eauldane.com/logos/ledger.png",
   "RepoUrl": "https://github.com/Eauldane/Ledger",

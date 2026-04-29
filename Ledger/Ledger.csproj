@@ -1,7 +1,7 @@
-<Project Sdk="Dalamud.NET.Sdk/14.0.2">
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
     <AssemblyName>Ledger</AssemblyName>
-    <Version>1.0.2</Version>
+    <Version>1.1.0</Version>
     <PackageProjectUrl>https://github.com/Eauldane/Ledger/</PackageProjectUrl>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -25,6 +25,6 @@
 
   <ItemGroup>
     <PackageReference Update="DotNet.ReproducibleBuilds" Version="2.0.2" />
-    <PackageReference Include="ElezenTools" Version="14.0.5" />
+    <PackageReference Include="ElezenTools" Version="15.0.1" />
   </ItemGroup>
 </Project>

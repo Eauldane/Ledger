@@ -1,13 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Dalamud.Plugin.Services;
+using ElezenTools.Data;
+using ElezenTools.Data.Classes;
 using Ledger.Data;
 using Ledger.Models;
-using Dalamud.Game;
-using Dalamud.Utility;
-using Dalamud.Plugin.Services;
-using Lumina.Excel.Sheets;
-using Lumina.Text.ReadOnly;
 
 namespace Ledger.Services;
 
@@ -15,53 +13,19 @@ public sealed class CollectionDataService
 {
     private static readonly TimeSpan CacheDuration = TimeSpan.FromSeconds(2);
 
-    private readonly IUnlockState _unlockState;
     private readonly IClientState _clientState;
     private readonly ConfigService _config;
-    private readonly ClientLanguage _language;
-    private readonly IReadOnlyList<Achievement> _achievements;
-    private readonly IReadOnlyDictionary<uint, string> _achievementCategories;
-    private readonly IReadOnlyList<Companion> _companions;
-    private readonly IReadOnlyDictionary<uint, CompanionTransient> _companionDetails;
-    private readonly IReadOnlyList<Title> _titles;
-    private readonly IReadOnlyList<TripleTriadCard> _tripleTriadCards;
-    private readonly IReadOnlyDictionary<uint, TripleTriadCardResident> _tripleTriadCardDetails;
-    private readonly IReadOnlyList<Mount> _mounts;
-    private readonly IReadOnlyDictionary<uint, MountTransient> _mountDetails;
-    private readonly IReadOnlyList<Orchestrion> _orchestrionRolls;
-    private readonly IReadOnlyDictionary<uint, OrchestrionUiparam> _orchestrionDetails;
-    private readonly IReadOnlyDictionary<uint, string> _orchestrionCategories;
-    private readonly IReadOnlyList<Ornament> _fashionAccessories;
-    private readonly IReadOnlyDictionary<uint, OrnamentTransient> _fashionAccessoryDetails;
-    private readonly IReadOnlyList<Glasses> _facewear;
-    private readonly IReadOnlyDictionary<uint, GlassesStyle> _facewearStyles;
+    private readonly TitleTrackingService _titles;
     private readonly object _cacheSync = new();
     private readonly Dictionary<CollectionKind, CollectionSnapshot> _snapshotCache = new();
     private AttainableSettings _cachedSettings;
     private DateTime _cacheExpiresUtc;
 
-    public CollectionDataService(IDataManager dataManager, IUnlockState unlockState, IClientState clientState, ConfigService config)
+    public CollectionDataService(IClientState clientState, ConfigService config, TitleTrackingService titles)
     {
-        _unlockState = unlockState;
         _clientState = clientState;
         _config = config;
-        _language = dataManager.Language;
-        _achievementCategories = LoadAchievementCategories(dataManager);
-        _achievements = LoadAchievements(dataManager);
-        _companions = LoadCompanions(dataManager);
-        _companionDetails = LoadCompanionDetails(dataManager);
-        _titles = LoadTitles(dataManager);
-        _tripleTriadCardDetails = LoadTripleTriadCardDetails(dataManager);
-        _tripleTriadCards = LoadTripleTriadCards(dataManager);
-        _mountDetails = LoadMountDetails(dataManager);
-        _mounts = LoadMounts(dataManager);
-        _orchestrionCategories = LoadOrchestrionCategories(dataManager);
-        _orchestrionDetails = LoadOrchestrionDetails(dataManager);
-        _orchestrionRolls = LoadOrchestrionRolls(dataManager);
-        _fashionAccessoryDetails = LoadFashionAccessoryDetails(dataManager);
-        _fashionAccessories = LoadFashionAccessories(dataManager);
-        _facewearStyles = LoadFacewearStyles(dataManager);
-        _facewear = LoadFacewear(dataManager);
+        _titles = titles;
     }
 
     public void Invalidate()
@@ -109,191 +73,210 @@ public sealed class CollectionDataService
         }
     }
 
+    public SyncCollectionRequest[] BuildSyncCollections(bool loadedOnly = false)
+    {
+        var collections = new List<SyncCollectionRequest>(CollectionKindExtensions.All.Length);
+        foreach (var kind in CollectionKindExtensions.All)
+        {
+            var snapshot = GetSnapshot(kind);
+            if (loadedOnly && !snapshot.OwnershipLoaded)
+            {
+                continue;
+            }
+
+            collections.Add(new SyncCollectionRequest
+            {
+                Kind = snapshot.Kind,
+                OwnershipLoaded = snapshot.OwnershipLoaded,
+                OwnedIds = snapshot.OwnershipLoaded
+                    ? snapshot.Entries.Where(entry => entry.Owned).Select(entry => (int)entry.Id).ToArray()
+                    : [],
+            });
+        }
+
+        return [.. collections];
+    }
+
     private CollectionSnapshot BuildAchievementSnapshot()
     {
-        var loaded = _clientState.IsLoggedIn && _unlockState.IsAchievementListLoaded;
-        var status = GetOwnershipStatus(loaded, "Open the achievements window to load your achievements.");
-        var ids = LimitedCollectables.GetIds(CollectionKind.Achievements);
-        var entries = _achievements
-            .Select(row =>
-            {
-                var category = _achievementCategories.TryGetValue(row.AchievementCategory.RowId, out var value) ? value : string.Empty;
-                var detail = category.Length > 0 ? $"{category} | {row.Description}" : row.Description.ToString();
-                return CreateEntry(
-                    CollectionKind.Achievements,
-                    row.RowId,
-                    row.Name.ToString(),
-                    detail,
-                    loaded && _unlockState.IsAchievementComplete(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.Achievements, loaded, status, entries);
+        var loaded = ElezenData.Achievements.IsUnlockListLoaded;
+        var ownedIds = ToOwnedIds(loaded, ElezenData.Achievements.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.Achievements,
+            loaded,
+            "Open the achievements window to load your achievements.",
+            ElezenData.Achievements.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Id),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            item => item.CategoryName,
+            item => item.Description);
     }
 
     private CollectionSnapshot BuildMinionSnapshot()
     {
         var loaded = _clientState.IsLoggedIn;
-        var status = GetOwnershipStatus(loaded, string.Empty);
-        var ids = LimitedCollectables.GetIds(CollectionKind.Minions);
-        var entries = _companions
-            .Select(row =>
-            {
-                var detail = _companionDetails.TryGetValue(row.RowId, out var transient)
-                    ? FirstNonEmpty(transient.Tooltip.ToString(), transient.Description.ToString(), transient.DescriptionEnhanced.ToString())
-                    : string.Empty;
-
-                return CreateEntry(
-                    CollectionKind.Minions,
-                    row.RowId,
-                    GetDisplayName(row.Singular),
-                    detail,
-                    loaded && _unlockState.IsCompanionUnlocked(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.Minions, loaded, status, entries);
+        var ownedIds = ToOwnedIds(loaded, ElezenData.Minions.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.Minions,
+            loaded,
+            string.Empty,
+            ElezenData.Minions.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            item => item.Description);
     }
 
     private CollectionSnapshot BuildTitleSnapshot()
     {
-        var loaded = _clientState.IsLoggedIn && _unlockState.IsTitleListLoaded;
-        var status = GetOwnershipStatus(loaded, "Open the title selector in the Character window to load your obtained titles.");
-        var ids = LimitedCollectables.GetIds(CollectionKind.Titles);
-        var entries = _titles
-            .Select(row =>
-            {
-                var name = GetTitleName(row);
-                var detail = row.IsPrefix ? "Prefix title" : "Suffix title";
-                return CreateEntry(
-                    CollectionKind.Titles,
-                    row.RowId,
-                    name,
-                    detail,
-                    loaded && _unlockState.IsTitleUnlocked(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.Titles, loaded, status, entries);
+        var loaded = _titles.IsLoaded;
+        IReadOnlySet<uint> ownedIds = loaded ? _titles.GetOwnedTitleIds() : new HashSet<uint>();
+        return BuildSnapshot(
+            CollectionKind.Titles,
+            loaded,
+            "Open the title selector in the Character window to load your obtained titles.",
+            ElezenData.Titles.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            item => item.IsPrefix ? "Prefix title" : "Suffix title");
     }
 
     private CollectionSnapshot BuildTripleTriadCardSnapshot()
     {
         var loaded = _clientState.IsLoggedIn;
-        var status = GetOwnershipStatus(loaded, string.Empty);
-        var ids = LimitedCollectables.GetIds(CollectionKind.TripleTriadCards);
-        var entries = _tripleTriadCards
-            .Select(row =>
-            {
-                var detail = GetTripleTriadDetail(row);
-                return CreateEntry(
-                    CollectionKind.TripleTriadCards,
-                    row.RowId,
-                    row.Name.ToString(),
-                    detail,
-                    loaded && _unlockState.IsTripleTriadCardUnlocked(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.TripleTriadCards, loaded, status, entries);
+        var ownedIds = ToOwnedIds(loaded, ElezenData.TripleTriadCards.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.TripleTriadCards,
+            loaded,
+            string.Empty,
+            ElezenData.TripleTriadCards.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            GetTripleTriadDetail);
     }
 
     private CollectionSnapshot BuildMountSnapshot()
     {
         var loaded = _clientState.IsLoggedIn;
-        var status = GetOwnershipStatus(loaded, string.Empty);
-        var ids = LimitedCollectables.GetIds(CollectionKind.Mounts);
-        var entries = _mounts
-            .Select(row =>
-            {
-                var detail = GetMountDetail(row);
-                return CreateEntry(
-                    CollectionKind.Mounts,
-                    row.RowId,
-                    GetDisplayName(row.Singular),
-                    detail,
-                    loaded && _unlockState.IsMountUnlocked(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.Mounts, loaded, status, entries);
+        var ownedIds = ToOwnedIds(loaded, ElezenData.Mounts.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.Mounts,
+            loaded,
+            string.Empty,
+            ElezenData.Mounts.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            GetMountDetail);
     }
 
     private CollectionSnapshot BuildOrchestrionSnapshot()
     {
         var loaded = _clientState.IsLoggedIn;
-        var status = GetOwnershipStatus(loaded, string.Empty);
-        var ids = LimitedCollectables.GetIds(CollectionKind.OrchestrionRolls);
-        var entries = _orchestrionRolls
-            .Select(row =>
-            {
-                var detail = GetOrchestrionDetail(row);
-                return CreateEntry(
-                    CollectionKind.OrchestrionRolls,
-                    row.RowId,
-                    row.Name.ToString(),
-                    detail,
-                    loaded && _unlockState.IsOrchestrionUnlocked(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.OrchestrionRolls, loaded, status, entries);
+        var ownedIds = ToOwnedIds(loaded, ElezenData.OrchestrionRolls.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.OrchestrionRolls,
+            loaded,
+            string.Empty,
+            ElezenData.OrchestrionRolls.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            GetOrchestrionDetail);
     }
 
     private CollectionSnapshot BuildFashionAccessorySnapshot()
     {
         var loaded = _clientState.IsLoggedIn;
-        var status = GetOwnershipStatus(loaded, string.Empty);
-        var ids = LimitedCollectables.GetIds(CollectionKind.FashionAccessories);
-        var entries = _fashionAccessories
-            .Select(row =>
-            {
-                var detail = GetFashionAccessoryDetail(row);
-                return CreateEntry(
-                    CollectionKind.FashionAccessories,
-                    row.RowId,
-                    row.Singular.ToString(),
-                    detail,
-                    loaded && _unlockState.IsOrnamentUnlocked(row),
-                    ids);
-            })
-            .ToArray();
-
-        return new CollectionSnapshot(CollectionKind.FashionAccessories, loaded, status, entries);
+        var ownedIds = ToOwnedIds(loaded, ElezenData.FashionAccessories.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.FashionAccessories,
+            loaded,
+            string.Empty,
+            ElezenData.FashionAccessories.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            item => item.Description);
     }
 
     private CollectionSnapshot BuildFacewearSnapshot()
     {
         var loaded = _clientState.IsLoggedIn;
-        var status = GetOwnershipStatus(loaded, string.Empty);
-        var ids = LimitedCollectables.GetIds(CollectionKind.Facewear);
-        var entries = _facewear
-            .Select(row =>
+        var ownedIds = ToOwnedIds(loaded, ElezenData.Facewear.GetUnlocked(), item => item.Id);
+        return BuildSnapshot(
+            CollectionKind.Facewear,
+            loaded,
+            string.Empty,
+            ElezenData.Facewear.GetAll().Values
+                .OrderBy(item => item.SortOrder)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
+            ownedIds,
+            item => item.Id,
+            item => item.Name,
+            _ => string.Empty,
+            GetFacewearDetail);
+    }
+
+    private CollectionSnapshot BuildSnapshot<TItem>(
+        CollectionKind kind,
+        bool loaded,
+        string loadHint,
+        IEnumerable<TItem> items,
+        IReadOnlySet<uint> ownedIds,
+        Func<TItem, uint> idSelector,
+        Func<TItem, string> nameSelector,
+        Func<TItem, string> categorySelector,
+        Func<TItem, string> detailSelector)
+    {
+        var status = GetOwnershipStatus(loaded, loadHint);
+        var ids = LimitedCollectables.GetIds(kind);
+        var entries = items
+            .Select(item =>
             {
-                var detail = GetFacewearDetail(row);
+                var id = idSelector(item);
                 return CreateEntry(
-                    CollectionKind.Facewear,
-                    row.RowId,
-                    GetFacewearName(row),
-                    detail,
-                    loaded && _unlockState.IsGlassesUnlocked(row),
+                    kind,
+                    id,
+                    nameSelector(item),
+                    categorySelector(item),
+                    detailSelector(item),
+                    loaded && ownedIds.Contains(id),
                     ids);
             })
             .ToArray();
 
-        return new CollectionSnapshot(CollectionKind.Facewear, loaded, status, entries);
+        return new CollectionSnapshot(kind, loaded, status, entries);
     }
 
     private CollectableEntry CreateEntry(
         CollectionKind kind,
         uint id,
         string name,
+        string category,
         string detail,
         bool owned,
         CollectableExclusionIds ids)
@@ -307,7 +290,7 @@ public sealed class CollectionDataService
             || (premium && _config.Current.ExcludePremiumFromAttainable)
             || (retiredPvp && _config.Current.ExcludeRetiredPvpFromAttainable);
 
-        return new CollectableEntry(kind, id, name, detail, owned, limited, premium, unobtainable, retiredPvp, excluded);
+        return new CollectableEntry(kind, id, name, category, detail, owned, limited, premium, unobtainable, retiredPvp, excluded);
     }
 
     private AttainableSettings GetAttainableSettings()
@@ -316,78 +299,57 @@ public sealed class CollectionDataService
             _config.Current.ExcludePremiumFromAttainable,
             _config.Current.ExcludeRetiredPvpFromAttainable);
 
-    private string GetTripleTriadDetail(TripleTriadCard row)
+    private static HashSet<uint> ToOwnedIds<TItem>(bool loaded, IReadOnlyList<TItem> items, Func<TItem, uint> idSelector)
     {
-        if (!_tripleTriadCardDetails.TryGetValue(row.RowId, out var resident))
+        if (!loaded)
         {
-            return row.Description.ToString();
+            return [];
         }
 
-        var rarity = resident.TripleTriadCardRarity.RowId;
-        var stats = $"{resident.Top}/{resident.Right}/{resident.Bottom}/{resident.Left}";
-        var description = row.Description.ToString();
-        return string.IsNullOrWhiteSpace(description)
-            ? $"Rarity {rarity} | {stats}"
-            : $"Rarity {rarity} | {stats} | {description}";
+        return items
+            .Select(idSelector)
+            .ToHashSet();
     }
 
-    private string GetMountDetail(Mount row)
+    private static string GetTripleTriadDetail(TripleTriadCardData card)
     {
-        var seats = Math.Max(1, row.ExtraSeats + 1);
-        var movement = row.IsAirborne ? "Airborne" : "Ground";
-        var summary = seats == 1 ? movement : $"{movement} | {seats} seats";
-
-        if (!_mountDetails.TryGetValue(row.RowId, out var transient))
-        {
-            return summary;
-        }
-
-        var description = FirstNonEmpty(
-            transient.Tooltip.ToString(),
-            transient.Description.ToString(),
-            transient.DescriptionEnhanced.ToString());
-
-        return string.IsNullOrWhiteSpace(description)
+        var summary = $"Rarity {card.Rarity} | {card.Top}/{card.Right}/{card.Bottom}/{card.Left}";
+        return string.IsNullOrWhiteSpace(card.Description)
             ? summary
-            : $"{summary} | {description}";
+            : $"{summary} | {card.Description}";
     }
 
-    private string GetOrchestrionDetail(Orchestrion row)
+    private static string GetMountDetail(MountData mount)
     {
-        var description = row.Description.ToString();
-        if (!_orchestrionDetails.TryGetValue(row.RowId, out var uiParam)
-            || !_orchestrionCategories.TryGetValue(uiParam.OrchestrionCategory.RowId, out var category))
-        {
-            return description;
-        }
-
-        return string.IsNullOrWhiteSpace(description)
-            ? category
-            : $"{category} | {description}";
+        var movement = mount.IsAirborne ? "Airborne" : "Ground";
+        var summary = mount.SeatCount == 1 ? movement : $"{movement} | {mount.SeatCount} seats";
+        return string.IsNullOrWhiteSpace(mount.Description)
+            ? summary
+            : $"{summary} | {mount.Description}";
     }
 
-    private string GetFashionAccessoryDetail(Ornament row)
+    private static string GetOrchestrionDetail(OrchestrionRollData roll)
     {
-        if (_fashionAccessoryDetails.TryGetValue(row.Transient, out var transient))
+        if (string.IsNullOrWhiteSpace(roll.CategoryName))
         {
-            return transient.Text.ToString();
+            return roll.Description;
         }
 
-        return string.Empty;
+        return string.IsNullOrWhiteSpace(roll.Description)
+            ? roll.CategoryName
+            : $"{roll.CategoryName} | {roll.Description}";
     }
 
-    private string GetFacewearDetail(Glasses row)
+    private static string GetFacewearDetail(FacewearData item)
     {
-        var description = row.Description.ToString();
-        if (!_facewearStyles.TryGetValue(row.Style.RowId, out var style))
+        if (string.IsNullOrWhiteSpace(item.StyleName))
         {
-            return description;
+            return item.Description;
         }
 
-        var styleName = FirstNonEmpty(style.Name.ToString(), style.Singular.ToString());
-        return string.IsNullOrWhiteSpace(description)
-            ? styleName
-            : $"{styleName} | {description}";
+        return string.IsNullOrWhiteSpace(item.Description)
+            ? item.StyleName
+            : $"{item.StyleName} | {item.Description}";
     }
 
     private string GetOwnershipStatus(bool loaded, string loadHint)
@@ -401,257 +363,6 @@ public sealed class CollectionDataService
             ? string.Empty
             : loadHint;
     }
-
-    private string GetDisplayName(in ReadOnlySeString name)
-        => string.Intern(name.ExtractText().ToUpper(true, true, false, _language));
-
-    private static IReadOnlyList<Achievement> LoadAchievements(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Achievement>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Name.ToString()))
-            .OrderBy(row => row.Order)
-            .ThenBy(row => row.RowId)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, string> LoadAchievementCategories(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<AchievementCategory>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, string>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Name.ToString()))
-            .ToDictionary(row => row.RowId, row => row.Name.ToString());
-    }
-
-    private static IReadOnlyList<Companion> LoadCompanions(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Companion>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Singular.ToString()))
-            .OrderBy(row => row.Order)
-            .ThenBy(row => row.Singular.ToString(), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, CompanionTransient> LoadCompanionDetails(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<CompanionTransient>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, CompanionTransient>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0)
-            .ToDictionary(row => row.RowId, row => row);
-    }
-
-    private static IReadOnlyList<Title> LoadTitles(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Title>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(GetTitleName(row)))
-            .OrderBy(row => row.Order)
-            .ThenBy(GetTitleName, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, TripleTriadCardResident> LoadTripleTriadCardDetails(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<TripleTriadCardResident>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, TripleTriadCardResident>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0)
-            .ToDictionary(row => row.RowId, row => row);
-    }
-
-    private IReadOnlyList<TripleTriadCard> LoadTripleTriadCards(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<TripleTriadCard>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Name.ToString()))
-            .OrderBy(row => _tripleTriadCardDetails.TryGetValue(row.RowId, out var resident) ? resident.Order : ushort.MaxValue)
-            .ThenBy(row => row.Name.ToString(), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, MountTransient> LoadMountDetails(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<MountTransient>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, MountTransient>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0)
-            .ToDictionary(row => row.RowId, row => row);
-    }
-
-    private static IReadOnlyList<Mount> LoadMounts(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Mount>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Singular.ToString()))
-            .OrderBy(row => row.Order < 0 ? short.MaxValue : row.Order)
-            .ThenBy(row => row.Singular.ToString(), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, string> LoadOrchestrionCategories(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<OrchestrionCategory>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, string>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Name.ToString()))
-            .ToDictionary(row => row.RowId, row => row.Name.ToString());
-    }
-
-    private static IReadOnlyDictionary<uint, OrchestrionUiparam> LoadOrchestrionDetails(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<OrchestrionUiparam>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, OrchestrionUiparam>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0)
-            .ToDictionary(row => row.RowId, row => row);
-    }
-
-    private IReadOnlyList<Orchestrion> LoadOrchestrionRolls(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Orchestrion>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Name.ToString()))
-            .OrderBy(row => _orchestrionDetails.TryGetValue(row.RowId, out var details) ? details.Order : ushort.MaxValue)
-            .ThenBy(row => row.Name.ToString(), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, OrnamentTransient> LoadFashionAccessoryDetails(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<OrnamentTransient>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, OrnamentTransient>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0)
-            .ToDictionary(row => row.RowId, row => row);
-    }
-
-    private static IReadOnlyList<Ornament> LoadFashionAccessories(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Ornament>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(row.Singular.ToString()))
-            .OrderBy(row => row.Order < 0 ? short.MaxValue : row.Order)
-            .ThenBy(row => row.Singular.ToString(), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<uint, GlassesStyle> LoadFacewearStyles(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<GlassesStyle>(dataManager.Language);
-        if (sheet is null)
-        {
-            return new Dictionary<uint, GlassesStyle>();
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0)
-            .ToDictionary(row => row.RowId, row => row);
-    }
-
-    private IReadOnlyList<Glasses> LoadFacewear(IDataManager dataManager)
-    {
-        var sheet = dataManager.GetExcelSheet<Glasses>(dataManager.Language);
-        if (sheet is null)
-        {
-            return [];
-        }
-
-        return sheet
-            .Where(row => row.RowId > 0 && !string.IsNullOrWhiteSpace(GetFacewearName(row)))
-            .OrderBy(row => _facewearStyles.TryGetValue(row.Style.RowId, out var style) ? style.Order : ushort.MaxValue)
-            .ThenBy(GetFacewearName, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static string GetTitleName(Title row)
-    {
-        var masculine = row.Masculine.ToString();
-        var feminine = row.Feminine.ToString();
-
-        if (string.IsNullOrWhiteSpace(masculine))
-        {
-            return feminine;
-        }
-
-        if (string.IsNullOrWhiteSpace(feminine) || string.Equals(masculine, feminine, StringComparison.Ordinal))
-        {
-            return masculine;
-        }
-
-        return $"{masculine} / {feminine}";
-    }
-
-    private static string GetFacewearName(Glasses row)
-        => FirstNonEmpty(row.Name.ToString(), row.Singular.ToString());
-
-    private static string FirstNonEmpty(params string[] values)
-        => values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
 
     private readonly record struct AttainableSettings(
         bool ExcludeLimited,

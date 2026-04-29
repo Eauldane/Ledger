@@ -8,6 +8,9 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Dalamud.Plugin.Services;
+using ElezenTools.Data;
+using Ledger.Config;
 using Ledger.Models;
 
 namespace Ledger.Services;
@@ -17,11 +20,12 @@ public sealed class LedgerServerService : IDisposable
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan RequestCooldown = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan SyncCooldown = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan AutoSyncCheckInterval = TimeSpan.FromSeconds(3);
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
 
     private readonly CollectionDataService _collections;
     private readonly ConfigService _config;
-    private readonly FriendListDebugService _friendListDebug;
+    private readonly IFramework _framework;
     private readonly PlayerIdentityService _playerIdentity;
     private readonly HttpClient _httpClient = new()
     {
@@ -29,22 +33,24 @@ public sealed class LedgerServerService : IDisposable
     };
     private readonly object _sync = new();
     private readonly Dictionary<ComparisonKey, ComparisonStateSnapshot> _comparisonStates = new();
-    private readonly Dictionary<OwnerKey, OwnerStateSnapshot> _ownerStates = new();
 
     private LedgerServerStatus _status = LedgerServerStatus.Initial;
     private Task? _syncTask;
     private Task? _healthCheckTask;
+    private PreparedSyncState? _lastSuccessfulSyncState;
+    private DateTimeOffset _nextAutoSyncCheckUtc = DateTimeOffset.MinValue;
 
     public LedgerServerService(
         CollectionDataService collections,
         ConfigService config,
-        FriendListDebugService friendListDebug,
-        PlayerIdentityService playerIdentity)
+        PlayerIdentityService playerIdentity,
+        IFramework framework)
     {
         _collections = collections;
         _config = config;
-        _friendListDebug = friendListDebug;
         _playerIdentity = playerIdentity;
+        _framework = framework;
+        _framework.Update += OnFrameworkUpdate;
     }
 
     public LedgerServerStatus GetStatus()
@@ -62,16 +68,6 @@ public sealed class LedgerServerService : IDisposable
             return _comparisonStates.TryGetValue(new ComparisonKey(kind, scope), out var state)
                 ? state
                 : CreateComparisonState(scope);
-        }
-    }
-
-    public OwnerStateSnapshot GetOwnerState(CollectionKind kind, CompareScope scope, int collectableId)
-    {
-        lock (_sync)
-        {
-            return _ownerStates.TryGetValue(new OwnerKey(kind, scope, collectableId), out var state)
-                ? state
-                : OwnerStateSnapshot.Initial;
         }
     }
 
@@ -120,7 +116,7 @@ public sealed class LedgerServerService : IDisposable
             _status = ApplyConfiguration(_status) with
             {
                 IsSyncing = true,
-                StatusMessage = "Syncing player data to the server...",
+                StatusMessage = "Syncing loaded collection data and friend list data to the server...",
                 LastAttemptUtc = now,
                 LastErrorMessage = null,
             };
@@ -161,45 +157,46 @@ public sealed class LedgerServerService : IDisposable
         _ = LoadComparisonAsync(key);
     }
 
-    public void RequestOwners(CollectionKind kind, CompareScope scope, int collectableId, bool force = false)
+    public void Dispose()
     {
-        if (collectableId <= 0)
+        _framework.Update -= OnFrameworkUpdate;
+        _httpClient.Dispose();
+    }
+
+    private void OnFrameworkUpdate(IFramework framework)
+    {
+        if (framework.IsFrameworkUnloading || !_config.Current.EnableServerComparison)
         {
             return;
         }
 
-        OwnerKey key;
-        lock (_sync)
+        var now = DateTimeOffset.UtcNow;
+        if (now < _nextAutoSyncCheckUtc)
         {
-            key = new OwnerKey(kind, scope, collectableId);
-            var current = _ownerStates.TryGetValue(key, out var state)
-                ? state
-                : OwnerStateSnapshot.Initial;
-
-            var now = DateTimeOffset.UtcNow;
-            if (current.IsLoading)
-            {
-                return;
-            }
-
-            if (!force && current.LastAttemptUtc.HasValue && now - current.LastAttemptUtc.Value < RequestCooldown)
-            {
-                return;
-            }
-
-            _ownerStates[key] = current with
-            {
-                IsLoading = true,
-                StatusMessage = "Loading owner list...",
-                LastAttemptUtc = now,
-            };
+            return;
         }
 
-        _ = LoadOwnersAsync(key);
-    }
+        _nextAutoSyncCheckUtc = now + AutoSyncCheckInterval;
 
-    public void Dispose()
-        => _httpClient.Dispose();
+        var currentState = CaptureCurrentSyncState(loadedOnly: true);
+        if (currentState is null || currentState.Collections.Count == 0)
+        {
+            return;
+        }
+
+        PreparedSyncState? lastSuccessfulState;
+        lock (_sync)
+        {
+            lastSuccessfulState = _lastSuccessfulSyncState;
+        }
+
+        if (lastSuccessfulState is not null && SyncStatesMatch(lastSuccessfulState, currentState))
+        {
+            return;
+        }
+
+        RequestSyncAll();
+    }
 
     private async Task HealthCheckAsync()
     {
@@ -232,78 +229,38 @@ public sealed class LedgerServerService : IDisposable
                 return;
             }
 
-            var identity = await _playerIdentity.GetLocalPlayerIdentityAsync().ConfigureAwait(false);
-            if (identity is null)
+            var syncState = await CaptureCurrentSyncStateAsync(loadedOnly: true).ConfigureAwait(false);
+            if (syncState is null)
             {
                 UpdateStatusFailure("Log in on a character before syncing.", null, clearBusyFlags: true);
                 return;
             }
 
-            var collections = CollectionKindExtensions.All
-                .Select(kind => _collections.GetSnapshot(kind))
-                .Select(snapshot => new SyncCollectionRequest
-                {
-                    Kind = snapshot.Kind,
-                    OwnershipLoaded = snapshot.OwnershipLoaded,
-                    OwnedIds = snapshot.OwnershipLoaded
-                        ? snapshot.Entries.Where(entry => entry.Owned).Select(entry => (int)entry.Id).ToArray()
-                        : [],
-                })
-                .ToArray();
-
-            var syncPlayerRequest = new SyncPlayerRequest
+            if (syncState.Collections.Count == 0)
             {
-                Ident = identity.Ident,
-                CharacterName = identity.CharacterName,
-                HomeWorldId = identity.HomeWorldId,
-                DatacenterId = identity.DatacenterId,
-                RegionId = identity.RegionId,
-                Collections = collections,
-            };
+                UpdateStatusFailure("No loaded collection data is ready to sync yet.", null, clearBusyFlags: true);
+                return;
+            }
 
+            var syncPlayerRequest = ToSyncPlayerRequest(syncState);
             using (var cts = CreateTimeoutTokenSource())
             {
                 await PostJsonAsync<SyncPlayerRequest, SyncPlayerResponse>(new Uri(baseUri, "api/players/sync"), syncPlayerRequest, cts.Token)
                     .ConfigureAwait(false);
             }
 
-            string? friendSyncMessage = null;
-            var friendSnapshot = await _friendListDebug.RefreshAsync().ConfigureAwait(false);
-            var friendIdents = friendSnapshot.Entries
-                .Select(entry => entry.Ident)
-                .Where(value => !string.IsNullOrWhiteSpace(value))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
-
-            if (friendIdents.Length > 0)
-            {
-                using var cts = CreateTimeoutTokenSource();
-                var friendsResponse = await PostJsonAsync<SyncFriendsRequest, SyncFriendsResponse>(
-                        new Uri(baseUri, $"api/players/{Uri.EscapeDataString(identity.Ident)}/friends"),
-                        new SyncFriendsRequest
-                        {
-                            FriendIdents = friendIdents,
-                        },
-                        cts.Token)
-                    .ConfigureAwait(false);
-
-                friendSyncMessage = $"Friends synced: {friendsResponse.FriendCount:N0} total, {friendsResponse.ResolvedFriendCount:N0} resolved.";
-            }
-            else if (friendSnapshot.Entries.Count == 0 && !string.IsNullOrWhiteSpace(friendSnapshot.StatusMessage))
-            {
-                friendSyncMessage = $"Friend sync skipped: {friendSnapshot.StatusMessage}";
-            }
+            var friendSyncMessage = await TrySyncFriendsAsync(baseUri, syncState.Ident).ConfigureAwait(false);
 
             UpdateStatusSuccess(
-                $"Synced {collections.Length:N0} collections for {identity.CharacterName}.",
+                $"Synced {syncState.Collections.Count:N0} collections.",
                 isSync: true,
                 friendSyncMessage: friendSyncMessage);
 
             ComparisonKey[] comparisonKeys;
             lock (_sync)
             {
+                _lastSuccessfulSyncState = syncState;
                 comparisonKeys = _comparisonStates.Keys.ToArray();
-                _ownerStates.Clear();
             }
 
             foreach (var key in comparisonKeys)
@@ -350,59 +307,50 @@ public sealed class LedgerServerService : IDisposable
                 _comparisonStates[key] = current with
                 {
                     IsLoading = false,
-                    StatusMessage = $"Loaded {result.LoadedPlayerCount:N0} synced players from {key.Scope.ToDisplayName().ToLowerInvariant()}.",
+                    StatusMessage = string.Empty,
                     LastUpdatedUtc = DateTimeOffset.UtcNow,
                     Result = result,
                 };
             }
 
-            UpdateStatusSuccess("Comparison data refreshed.", isSync: false, friendSyncMessage: null);
+            UpdateStatusSuccess("Data refreshed.", isSync: false, friendSyncMessage: null);
         }
         catch (Exception ex)
         {
-            UpdateComparisonFailure(key, "Failed to load comparison data.", ex);
+            UpdateComparisonFailure(key, "Failed to load data.", ex);
         }
     }
 
-    private async Task LoadOwnersAsync(OwnerKey key)
+    private async Task<string?> TrySyncFriendsAsync(Uri baseUri, string ident)
     {
         try
         {
-            if (!TryGetServerBaseUri(out var baseUri, out var configurationError))
+            var friendIdents = (await ElezenData.Friends.RefreshAsync().ConfigureAwait(false))
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Name) && entry.HomeWorldId != 0)
+                .Select(entry => PlayerIdentityService.ComputeIdent(entry.Name, entry.HomeWorldId))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+
+            if (friendIdents.Length == 0)
             {
-                UpdateOwnerFailure(key, configurationError, null);
-                return;
+                return null;
             }
 
-            var identity = await _playerIdentity.GetLocalPlayerIdentityAsync().ConfigureAwait(false);
-            if (identity is null)
-            {
-                UpdateOwnerFailure(key, "Log in on a character before loading owner details.", null);
-                return;
-            }
+            using var cts = CreateTimeoutTokenSource();
+            await PostJsonAsync<SyncFriendsRequest, SyncFriendsResponse>(
+                    new Uri(baseUri, $"api/players/{Uri.EscapeDataString(ident)}/friends"),
+                    new SyncFriendsRequest
+                    {
+                        FriendIdents = friendIdents,
+                    },
+                    cts.Token)
+                .ConfigureAwait(false);
 
-            var relativeUri = $"api/compare/{key.Scope.ToApiValue()}/owners?requesterIdent={Uri.EscapeDataString(identity.Ident)}&collectionKind={Uri.EscapeDataString(key.Kind.ToString())}&collectableId={key.CollectableId}";
-            CompareOwnersResponse result;
-            using (var cts = CreateTimeoutTokenSource())
-            {
-                result = await GetJsonAsync<CompareOwnersResponse>(new Uri(baseUri, relativeUri), cts.Token).ConfigureAwait(false);
-            }
-
-            lock (_sync)
-            {
-                _ownerStates[key] = new OwnerStateSnapshot(
-                    false,
-                    result.OwnerCount == 0 ? "Nobody in this scope has that unlock yet." : $"Loaded {result.OwnerCount:N0} owners.",
-                    DateTimeOffset.UtcNow,
-                    _ownerStates.TryGetValue(key, out var state) ? state.LastAttemptUtc : DateTimeOffset.UtcNow,
-                    result);
-            }
-
-            UpdateStatusSuccess("Owner detail refreshed.", isSync: false, friendSyncMessage: null);
+            return null;
         }
         catch (Exception ex)
         {
-            UpdateOwnerFailure(key, "Failed to load owner detail.", ex);
+            return $"Friend sync skipped. {GetFriendlyErrorMessage(ex)}";
         }
     }
 
@@ -431,24 +379,6 @@ public sealed class LedgerServerService : IDisposable
         UpdateStatusFailure(message, ex, clearBusyFlags: false);
     }
 
-    private void UpdateOwnerFailure(OwnerKey key, string message, Exception? ex)
-    {
-        lock (_sync)
-        {
-            var current = _ownerStates.TryGetValue(key, out var state)
-                ? state
-                : OwnerStateSnapshot.Initial;
-
-            _ownerStates[key] = current with
-            {
-                IsLoading = false,
-                StatusMessage = ex is null ? message : $"{message} {GetFriendlyErrorMessage(ex)}",
-            };
-        }
-
-        UpdateStatusFailure(message, ex, clearBusyFlags: false);
-    }
-
     private void UpdateStatusSuccess(string message, bool isSync, string? friendSyncMessage)
     {
         lock (_sync)
@@ -458,7 +388,7 @@ public sealed class LedgerServerService : IDisposable
                 IsSyncing = false,
                 IsCheckingConnection = false,
                 StatusMessage = message,
-                FriendSyncMessage = friendSyncMessage ?? _status.FriendSyncMessage,
+                FriendSyncMessage = friendSyncMessage,
                 LastErrorMessage = null,
                 LastSuccessfulRequestUtc = DateTimeOffset.UtcNow,
                 LastSuccessfulSyncUtc = isSync ? DateTimeOffset.UtcNow : _status.LastSuccessfulSyncUtc,
@@ -482,7 +412,6 @@ public sealed class LedgerServerService : IDisposable
 
     private bool TryGetServerBaseUri(out Uri baseUri, out string errorMessage)
     {
-        var serverBaseUrl = _config.Current.ServerBaseUrl?.Trim() ?? string.Empty;
         if (!_config.Current.EnableServerComparison)
         {
             baseUri = null!;
@@ -490,14 +419,7 @@ public sealed class LedgerServerService : IDisposable
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(serverBaseUrl))
-        {
-            baseUri = null!;
-            errorMessage = "Configure a server URL before using comparisons.";
-            return false;
-        }
-
-        if (!Uri.TryCreate(serverBaseUrl.EndsWith('/') ? serverBaseUrl : $"{serverBaseUrl}/", UriKind.Absolute, out var parsedUri))
+        if (!Uri.TryCreate(LedgerServerDefaults.BaseUrl, UriKind.Absolute, out var parsedUri))
         {
             baseUri = null!;
             errorMessage = "The configured server URL is invalid.";
@@ -577,16 +499,97 @@ public sealed class LedgerServerService : IDisposable
 
     private LedgerServerStatus ApplyConfiguration(LedgerServerStatus status)
     {
-        var serverBaseUrl = string.IsNullOrWhiteSpace(_config.Current.ServerBaseUrl)
-            ? null
-            : _config.Current.ServerBaseUrl.Trim();
-
-        return status with
+        var configuredStatus = status with
         {
             Enabled = _config.Current.EnableServerComparison,
-            Configured = serverBaseUrl is not null,
-            ServerBaseUrl = serverBaseUrl,
+            Configured = true,
+            ServerBaseUrl = LedgerServerDefaults.BaseUrl,
         };
+
+        if (!configuredStatus.Enabled)
+        {
+            return configuredStatus with
+            {
+                IsSyncing = false,
+                IsCheckingConnection = false,
+                StatusMessage = "Server sync is disabled.",
+                LastErrorMessage = null,
+            };
+        }
+
+        return configuredStatus;
+    }
+
+    private PreparedSyncState? CaptureCurrentSyncState(bool loadedOnly)
+    {
+        var identity = _playerIdentity.GetLocalPlayerIdentityOnFrameworkThread();
+        return identity is null ? null : CreatePreparedSyncState(identity, loadedOnly);
+    }
+
+    private async Task<PreparedSyncState?> CaptureCurrentSyncStateAsync(bool loadedOnly)
+    {
+        var identity = await _playerIdentity.GetLocalPlayerIdentityAsync().ConfigureAwait(false);
+        return identity is null ? null : CreatePreparedSyncState(identity, loadedOnly);
+    }
+
+    private PreparedSyncState CreatePreparedSyncState(LocalPlayerIdentity identity, bool loadedOnly)
+    {
+        var collections = _collections.BuildSyncCollections(loadedOnly)
+            .Select(collection => new PreparedCollectionSync(
+                collection.Kind,
+                collection.OwnershipLoaded,
+                collection.OwnedIds.ToArray()))
+            .ToArray();
+
+        return new PreparedSyncState(
+            identity.Ident,
+            identity.HomeWorldId,
+            identity.DatacenterId,
+            identity.RegionId,
+            collections);
+    }
+
+    private static SyncPlayerRequest ToSyncPlayerRequest(PreparedSyncState state)
+        => new()
+        {
+            Ident = state.Ident,
+            HomeWorldId = state.HomeWorldId,
+            DatacenterId = state.DatacenterId,
+            RegionId = state.RegionId,
+            Collections = state.Collections
+                .Select(collection => new SyncCollectionRequest
+                {
+                    Kind = collection.Kind,
+                    OwnershipLoaded = collection.OwnershipLoaded,
+                    OwnedIds = collection.OwnedIds,
+                })
+                .ToArray(),
+        };
+
+    private static bool SyncStatesMatch(PreparedSyncState left, PreparedSyncState right)
+    {
+        if (!string.Equals(left.Ident, right.Ident, StringComparison.Ordinal)
+            || left.HomeWorldId != right.HomeWorldId
+            || left.DatacenterId != right.DatacenterId
+            || left.RegionId != right.RegionId
+            || left.Collections.Count != right.Collections.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < left.Collections.Count; i++)
+        {
+            var leftCollection = left.Collections[i];
+            var rightCollection = right.Collections[i];
+            if (leftCollection.Kind != rightCollection.Kind
+                || leftCollection.OwnershipLoaded != rightCollection.OwnershipLoaded
+                || !leftCollection.OwnedIds.SequenceEqual(rightCollection.OwnedIds))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static ComparisonStateSnapshot CreateComparisonState(CompareScope scope)
@@ -600,7 +603,17 @@ public sealed class LedgerServerService : IDisposable
 
     private readonly record struct ComparisonKey(CollectionKind Kind, CompareScope Scope);
 
-    private readonly record struct OwnerKey(CollectionKind Kind, CompareScope Scope, int CollectableId);
+    private sealed record PreparedSyncState(
+        string Ident,
+        int HomeWorldId,
+        int DatacenterId,
+        int RegionId,
+        IReadOnlyList<PreparedCollectionSync> Collections);
+
+    private sealed record PreparedCollectionSync(
+        CollectionKind Kind,
+        bool OwnershipLoaded,
+        int[] OwnedIds);
 }
 
 public sealed record LedgerServerStatus(
@@ -640,18 +653,3 @@ public sealed record ComparisonStateSnapshot(
     DateTimeOffset? LastUpdatedUtc,
     DateTimeOffset? LastAttemptUtc,
     CompareCollectionResponse? Result);
-
-public sealed record OwnerStateSnapshot(
-    bool IsLoading,
-    string StatusMessage,
-    DateTimeOffset? LastUpdatedUtc,
-    DateTimeOffset? LastAttemptUtc,
-    CompareOwnersResponse? Result)
-{
-    public static readonly OwnerStateSnapshot Initial = new(
-        false,
-        "Select an item to load owner detail.",
-        null,
-        null,
-        null);
-}
