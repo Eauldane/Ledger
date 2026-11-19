@@ -4,6 +4,7 @@ using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using Dalamud.Utility;
 using ElezenTools.UI;
@@ -16,16 +17,16 @@ namespace Ledger.UI;
 public sealed class LedgerWindow : Window
 {
     private const string AllAchievementCategoriesLabel = "All categories";
-    private static readonly Vector4 OwnedColor = new(0.55f, 0.88f, 0.55f, 1f);
-    private static readonly Vector4 MissingColor = new(0.95f, 0.55f, 0.42f, 1f);
-    private static readonly Vector4 WarningColor = new(0.95f, 0.74f, 0.35f, 1f);
+    private static readonly Vector4 OwnedColor = LedgerTheme.Palette.BooleanTrue;
+    private static readonly Vector4 MissingColor = LedgerTheme.Palette.BooleanFalse;
+    private static readonly Vector4 WarningColor = LedgerTheme.Warning;
 
     private readonly CollectionDataService _collections;
     private readonly ConfigService _config;
     private readonly LedgerServerService _server;
     private readonly PlayerIdentityService _playerIdentity;
     private readonly Action _openSettings;
-    private readonly Dictionary<CollectionKind, CompareScope> _selectedScopes = [];
+    private CollectionKind? _selectedKind;
 
     private string _searchText = string.Empty;
     private string? _selectedAchievementCategory;
@@ -60,53 +61,102 @@ public sealed class LedgerWindow : Window
         ];
         SizeConstraints = new WindowSizeConstraints
         {
-            MinimumSize = new Vector2(860, 620),
+            MinimumSize = new Vector2(920, 620),
             MaximumSize = new Vector2(1900, 1400),
         };
+        Size = new Vector2(1120, 740);
+        SizeCondition = ImGuiCond.FirstUseEver;
     }
 
     public override void Draw()
     {
-        DrawOverview();
-        ImGui.Separator();
-        DrawCategoryTabs();
+        ImGui.BeginChild("##ledgerSidebar", new Vector2(230f * ImGuiHelpers.GlobalScale, 0), true);
+        DrawSidebar();
+        ImGui.EndChild();
+        ImGui.SameLine();
+        ImGui.BeginChild("##ledgerContent", Vector2.Zero, false, ImGuiWindowFlags.AlwaysUseWindowPadding);
+        DrawToolbar();
+        ModernSection.SoftSeparator();
+        if (_selectedKind is { } kind)
+        {
+            DrawSelectedCategory(_collections.GetSnapshot(kind));
+        }
+        else
+        {
+            DrawOverview();
+        }
+        ImGui.EndChild();
     }
 
-    private void DrawOverview()
+    private void DrawSidebar()
     {
-        if (ElezenImgui.ShowIconButton(FontAwesomeIcon.SyncAlt, "Refresh"))
+        ModernSection.Header(FontAwesomeIcon.Book, "Ledger");
+        ImGui.TextDisabled("Your collection journal");
+        ModernSidebar.DrawSeparator();
+        if (ModernSidebar.DrawRow(FontAwesomeIcon.ChartBar, "Overview", _selectedKind is null))
+        {
+            _selectedKind = null;
+        }
+        ModernSidebar.DrawSeparator();
+        foreach (var kind in CollectionKindExtensions.All)
+        {
+            if (ModernSidebar.DrawRow(GetCollectionIcon(kind), kind.ToDisplayName(), _selectedKind == kind))
+            {
+                _selectedKind = kind;
+            }
+        }
+        ModernSidebar.DrawSeparator();
+        if (ModernSidebar.DrawRow(FontAwesomeIcon.Cog, "Settings", active: false))
+        {
+            _openSettings();
+        }
+    }
+
+    private static FontAwesomeIcon GetCollectionIcon(CollectionKind kind) => kind switch
+    {
+        CollectionKind.Achievements => FontAwesomeIcon.Trophy,
+        CollectionKind.Minions => FontAwesomeIcon.Paw,
+        CollectionKind.Titles => FontAwesomeIcon.Crown,
+        CollectionKind.TripleTriadCards => FontAwesomeIcon.Clone,
+        CollectionKind.Mounts => FontAwesomeIcon.Horse,
+        CollectionKind.OrchestrionRolls => FontAwesomeIcon.Music,
+        CollectionKind.FashionAccessories => FontAwesomeIcon.Umbrella,
+        CollectionKind.Facewear => FontAwesomeIcon.Glasses,
+        _ => FontAwesomeIcon.Book,
+    };
+
+    private void DrawToolbar()
+    {
+        if (ElezenImgui.ShowIconButton(FontAwesomeIcon.SyncAlt, " Refresh"))
         {
             _collections.Invalidate();
         }
         ElezenImgui.AttachTooltip("Rebuild the cached collection snapshots and refresh the progress view.");
 
         ImGui.SameLine();
-        if (ImGui.Button("Settings"))
-        {
-            _openSettings();
-        }
-        ElezenImgui.DrawHelpText("Open Ledger settings.");
-
-        ImGui.SameLine();
-        ImGui.BeginDisabled(!_config.Current.EnableServerComparison);
-        if (ImGui.Button("Sync with server"))
+        var serverStatus = _server.GetStatus();
+        ImGui.BeginDisabled(!serverStatus.Enabled || serverStatus.IsSyncing);
+        if (ElezenImgui.ShowIconButton(FontAwesomeIcon.CloudUploadAlt, " Sync with server"))
         {
             _server.RequestSyncAll(force: true);
         }
         ImGui.EndDisabled();
         ElezenImgui.DrawHelpText("Sync your currently loaded collection data and friend list data to the Ledger server.");
 
-        var serverStatus = _server.GetStatus();
         if (!string.IsNullOrWhiteSpace(serverStatus.StatusMessage))
         {
-            ImGui.SameLine();
             var statusColor = serverStatus.LastErrorMessage is null ? OwnedColor : WarningColor;
-            ImGui.TextColored(statusColor, serverStatus.StatusMessage);
+            ElezenImgui.ColouredWrappedText(serverStatus.StatusMessage, statusColor);
+        }
+
+        if (!string.IsNullOrWhiteSpace(serverStatus.FriendSyncMessage))
+        {
+            ElezenImgui.ColouredWrappedText(serverStatus.FriendSyncMessage, WarningColor);
         }
 
         if (!LimitedCollectables.IsLoaded)
         {
-            ImGui.TextColored(WarningColor, $"Exclusion data was not loaded: {LimitedCollectables.LoadError}");
+            ElezenImgui.ColouredWrappedText($"Exclusion data was not loaded: {LimitedCollectables.LoadError}", WarningColor);
         }
 
         if (serverStatus.LastSuccessfulSyncUtc.HasValue)
@@ -114,16 +164,23 @@ public sealed class LedgerWindow : Window
             ImGui.TextDisabled($"Last server sync {serverStatus.LastSuccessfulSyncUtc.Value.ToLocalTime():HH:mm:ss}");
         }
 
-        ImGui.Spacing();
+    }
 
-        ImGui.Columns(2, "##ledgerOverview", false);
+    private void DrawOverview()
+    {
+        ModernSection.Header(FontAwesomeIcon.ChartBar, "Collection overview");
+        ElezenImgui.WrappedText("Track your attainable collection. Choose a collection from the sidebar to browse items and compare unlocks.");
+        ImGui.Spacing();
+        if (!ImGui.BeginTable("##ledgerOverview", 2, ImGuiTableFlags.SizingStretchSame))
+        {
+            return;
+        }
         foreach (var kind in CollectionKindExtensions.All)
         {
+            ImGui.TableNextColumn();
             DrawOverviewEntry(_collections.GetSnapshot(kind));
-            ImGui.NextColumn();
         }
-
-        ImGui.Columns(1);
+        ImGui.EndTable();
     }
 
     private static void DrawOverviewEntry(CollectionSnapshot snapshot)
@@ -137,30 +194,9 @@ public sealed class LedgerWindow : Window
         ImGui.Spacing();
     }
 
-    private void DrawCategoryTabs()
-    {
-        if (!ImGui.BeginTabBar("##ledgerCategories"))
-        {
-            return;
-        }
-
-        foreach (var kind in CollectionKindExtensions.All)
-        {
-            if (!ImGui.BeginTabItem(kind.ToDisplayName()))
-            {
-                continue;
-            }
-
-            DrawSelectedCategory(_collections.GetSnapshot(kind));
-            ImGui.EndTabItem();
-        }
-
-        ImGui.EndTabBar();
-    }
-
     private void DrawSelectedCategory(CollectionSnapshot snapshot)
     {
-        var scope = GetSelectedScope(snapshot.Kind);
+        var scope = _config.Current.LastComparisonScope;
         var comparisonState = _server.GetComparisonState(snapshot.Kind, scope);
         if (_config.Current.EnableServerComparison
             && comparisonState.Result is null
@@ -171,12 +207,12 @@ public sealed class LedgerWindow : Window
         }
 
         DrawSnapshotHeader(snapshot);
-        ImGui.Separator();
+        ModernSection.SoftSeparator();
         DrawComparisonPanel(snapshot, ref scope, comparisonState);
         comparisonState = _server.GetComparisonState(snapshot.Kind, scope);
-        ImGui.Separator();
+        ModernSection.SoftSeparator();
         DrawFilters(snapshot);
-        ImGui.Separator();
+        ModernSection.SoftSeparator();
         DrawEntryTable(snapshot, comparisonState);
     }
 
@@ -184,8 +220,9 @@ public sealed class LedgerWindow : Window
     {
         var serverStatus = _server.GetStatus();
 
-        ImGui.TextUnformatted("Comparison");
+        ModernSection.Header(FontAwesomeIcon.Users, "Comparison");
 
+        ImGui.SetNextItemWidth(170f * ImGuiHelpers.GlobalScale);
         if (ImGui.BeginCombo("Scope", scope.ToDisplayName()))
         {
             foreach (var option in CompareScopeExtensions.AllScopes)
@@ -194,7 +231,7 @@ public sealed class LedgerWindow : Window
                 if (ImGui.Selectable(option.ToDisplayName(), selected))
                 {
                     scope = option;
-                    _selectedScopes[snapshot.Kind] = option;
+                    _config.SetComparisonScope(option);
                     _server.RequestComparison(snapshot.Kind, option, force: true);
                 }
 
@@ -207,21 +244,24 @@ public sealed class LedgerWindow : Window
             ImGui.EndCombo();
         }
 
-        ImGui.SameLine();
-        if (ImGui.Button("Refresh Comparison"))
+        ImGui.BeginDisabled(!serverStatus.Enabled);
+        if (ElezenImgui.ShowIconButton(FontAwesomeIcon.SyncAlt, " Refresh comparison"))
         {
             _server.RequestComparison(snapshot.Kind, scope, force: true);
         }
 
         ImGui.SameLine();
-        if (ImGui.Button("Sync and Refresh"))
+        ImGui.BeginDisabled(serverStatus.IsSyncing);
+        if (ElezenImgui.ShowIconButton(FontAwesomeIcon.CloudUploadAlt, " Sync and refresh"))
         {
             _server.RequestSyncAll(force: true);
         }
+        ImGui.EndDisabled();
+        ImGui.EndDisabled();
 
         if (!serverStatus.Enabled)
         {
-            ImGui.TextColored(WarningColor, "Server comparison is disabled. Enable sync in Settings.");
+            ElezenImgui.ColouredWrappedText("Server comparison is disabled. Enable sync in Settings.", WarningColor);
             return;
         }
 
@@ -230,18 +270,17 @@ public sealed class LedgerWindow : Window
             var stateColor = comparisonState.Result is not null && !comparisonState.IsLoading
                 ? OwnedColor
                 : WarningColor;
-            ImGui.TextColored(stateColor, comparisonState.StatusMessage);
+            ElezenImgui.ColouredWrappedText(comparisonState.StatusMessage, stateColor);
         }
 
     }
 
     private static void DrawSnapshotHeader(CollectionSnapshot snapshot)
     {
-        ImGui.TextUnformatted(snapshot.Kind.ToDisplayName());
+        ModernSection.Header(GetCollectionIcon(snapshot.Kind), snapshot.Kind.ToDisplayName());
         if (snapshot.OwnershipLoaded)
         {
             ImGui.TextUnformatted($"{snapshot.AttainableOwned:N0} of {snapshot.AttainableTotal:N0} attainable collected");
-            ImGui.SameLine();
             ImGui.TextDisabled($"({snapshot.OwnedTotal:N0} of {snapshot.Total:N0} total, {snapshot.ExcludedOwned:N0} owned excluded)");
             DrawAttainableProgress(snapshot, "Attainable completion", $"{snapshot.CompletionRatio:P1}", 20f);
         }
@@ -267,7 +306,7 @@ public sealed class LedgerWindow : Window
                 snapshot.CompletionRatio,
                 barText: loadedBarText,
                 statusText: $"{snapshot.MissingAttainable:N0} missing",
-                height: height);
+                height: height * ImGuiHelpers.GlobalScale);
             return;
         }
 
@@ -277,17 +316,13 @@ public sealed class LedgerWindow : Window
             barText: $"{snapshot.AttainableTotal:N0} tracked",
             statusText: showUnloadedStatus ? snapshot.StatusMessage : null,
             statusColour: WarningColor,
-            height: height);
+            height: height * ImGuiHelpers.GlobalScale);
     }
 
     private void DrawFilters(CollectionSnapshot snapshot)
     {
         var showAchievementCategory = snapshot.Kind == CollectionKind.Achievements;
-        var searchWidth = showAchievementCategory
-            ? Math.Max(220f, ImGui.GetContentRegionAvail().X - 460f)
-            : Math.Max(220f, ImGui.GetContentRegionAvail().X - 240f);
-
-        ImGui.SetNextItemWidth(searchWidth);
+        ImGui.SetNextItemWidth(-1);
         ImGui.InputTextWithHint("##ledgerSearch", "Search by name, category, detail, or ID", ref _searchText, 256);
 
         if (showAchievementCategory)
@@ -308,7 +343,7 @@ public sealed class LedgerWindow : Window
 
         ImGui.TextDisabled($"Showing {filteredEntries.Length:N0} of {snapshot.Entries.Count:N0}");
 
-        var tableHeight = Math.Max(220f, ImGui.GetContentRegionAvail().Y - 8f);
+        var tableHeight = Math.Max(1f, ImGui.GetContentRegionAvail().Y - 8f * ImGuiHelpers.GlobalScale);
         var tableFlags = ImGuiTableFlags.Borders
                          | ImGuiTableFlags.RowBg
                          | ImGuiTableFlags.Resizable
@@ -414,8 +449,7 @@ public sealed class LedgerWindow : Window
             _selectedAchievementCategory = null;
         }
 
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(Math.Max(180f, Math.Min(260f, ImGui.GetContentRegionAvail().X - 16f)));
+        ImGui.SetNextItemWidth(230f * ImGuiHelpers.GlobalScale);
         var selectedLabel = _selectedAchievementCategory ?? AllAchievementCategoriesLabel;
         if (!ImGui.BeginCombo("Category", selectedLabel))
         {
@@ -507,17 +541,6 @@ public sealed class LedgerWindow : Window
         }
 
         ImGui.TextColored(MissingColor, "No");
-    }
-
-    private CompareScope GetSelectedScope(CollectionKind kind)
-    {
-        if (_selectedScopes.TryGetValue(kind, out var scope))
-        {
-            return scope;
-        }
-
-        _selectedScopes[kind] = CompareScope.Server;
-        return CompareScope.Server;
     }
 
     private static DisplayEntry[] SortVisibleEntries(DisplayEntry[] entries, bool ownershipLoaded, bool showCategoryColumn, bool showComparisonColumn)

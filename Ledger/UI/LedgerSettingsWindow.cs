@@ -1,7 +1,8 @@
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using Dalamud.Interface.Windowing;
-using Ledger.Config;
+using ElezenTools.UI;
 using Ledger.Services;
 
 namespace Ledger.UI;
@@ -26,25 +27,28 @@ public sealed class LedgerSettingsWindow : Window
             MinimumSize = new Vector2(420, 260),
             MaximumSize = new Vector2(900, 700),
         };
+        Size = new Vector2(520, 620);
+        SizeCondition = ImGuiCond.FirstUseEver;
     }
 
     public override void Draw()
     {
         DrawServerSettings();
-        ImGui.Separator();
+        ModernSection.SoftSeparator();
         DrawCollectionSettings();
-        ImGui.Separator();
+        ModernSection.SoftSeparator();
         DrawViewSettings();
     }
 
     private void DrawServerSettings()
     {
-        ImGui.TextUnformatted("Server");
+        ModernSection.Header(FontAwesomeIcon.Cloud, "Server");
         var enableServerComparison = _config.Current.EnableServerComparison;
         if (ImGui.Checkbox("Enable sync and comparison", ref enableServerComparison))
         {
             _config.Current.EnableServerComparison = enableServerComparison;
             _config.Save();
+            _server.ResetSession();
 
             if (enableServerComparison)
             {
@@ -55,13 +59,17 @@ public sealed class LedgerSettingsWindow : Window
         var serverStatus = _server.GetStatus();
         if (!string.IsNullOrWhiteSpace(serverStatus.StatusMessage))
         {
-            ImGui.TextWrapped(serverStatus.StatusMessage);
+            ElezenImgui.WrappedText(serverStatus.StatusMessage);
+        }
+        if (!string.IsNullOrWhiteSpace(serverStatus.FriendSyncMessage))
+        {
+            ElezenImgui.ColouredWrappedText(serverStatus.FriendSyncMessage, LedgerTheme.Warning);
         }
     }
 
     private void DrawCollectionSettings()
     {
-        ImGui.TextUnformatted("Collection Rules");
+        ModernSection.Header(FontAwesomeIcon.Book, "Collection rules");
 
         var changed = false;
         var excludeLimited = _config.Current.ExcludeLimitedFromAttainable;
@@ -105,9 +113,18 @@ public sealed class LedgerSettingsWindow : Window
 
     private void DrawViewSettings()
     {
-        ImGui.TextUnformatted("View");
+        ModernSection.Header(FontAwesomeIcon.Eye, "View");
 
         var changed = false;
+        var missingOnly = _config.Current.MissingOnly;
+        if (DrawCheckboxWithHelp(
+                "Missing only",
+                ref missingOnly,
+                "Show only items you have not collected. Disable to include owned items."))
+        {
+            _config.Current.MissingOnly = missingOnly;
+            changed = true;
+        }
         var showExcluded = _config.Current.ShowExcluded;
         if (DrawCheckboxWithHelp(
                 "Show excluded",
@@ -127,7 +144,8 @@ public sealed class LedgerSettingsWindow : Window
     private static bool DrawCheckboxWithHelp(string label, ref bool value, string helpText)
     {
         var changed = ImGui.Checkbox(label, ref value);
-        ImGui.TextDisabled(helpText);
+        ElezenImgui.ColouredWrappedText(helpText, LedgerTheme.Palette.CompactTextMuted);
+        ImGui.Spacing();
         return changed;
     }
 }

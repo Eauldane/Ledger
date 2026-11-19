@@ -1,5 +1,7 @@
 using Dalamud.Plugin;
 using Ledger.Config;
+using Ledger.Models;
+using System;
 
 namespace Ledger.Services;
 
@@ -19,6 +21,22 @@ public sealed class ConfigService
 
     public void Save()
         => _pluginInterface.SavePluginConfig(Current);
+
+    public void SetComparisonScope(CompareScope scope)
+    {
+        if (!Enum.IsDefined(scope))
+        {
+            throw new ArgumentOutOfRangeException(nameof(scope));
+        }
+
+        if (Current.LastComparisonScope == scope)
+        {
+            return;
+        }
+
+        Current.LastComparisonScope = scope;
+        Save();
+    }
 
     private static void Migrate(LedgerConfig config)
     {
@@ -50,6 +68,16 @@ public sealed class ConfigService
             config.MissingOnly = true;
             config.ShowExcluded = false;
             config.Version = 5;
+        }
+
+        if (config.Version < 6)
+        {
+            config.Version = 6;
+        }
+
+        if (!Enum.IsDefined(config.LastComparisonScope))
+        {
+            config.LastComparisonScope = CompareScope.Server;
         }
     }
 }

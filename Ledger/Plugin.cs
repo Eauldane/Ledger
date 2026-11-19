@@ -45,7 +45,7 @@ public sealed class Plugin : IDalamudPlugin
         _collections = new CollectionDataService(clientState, _config, _titles);
         _titles.Changed += _collections.Invalidate;
         _playerIdentity = new PlayerIdentityService(framework, playerState, objectTable);
-        _server = new LedgerServerService(_collections, _config, _playerIdentity, framework);
+        _server = new LedgerServerService(_collections, _config, _playerIdentity, framework, clientState);
         _settingsWindow = new LedgerSettingsWindow(_collections, _config, _server);
         _mainWindow = new LedgerWindow(_collections, _config, _server, _playerIdentity, OpenSettingsUi);
         _windowSystem.AddWindow(_mainWindow);
@@ -84,5 +84,8 @@ public sealed class Plugin : IDalamudPlugin
         => _settingsWindow.IsOpen = true;
 
     private void DrawUi()
-        => _windowSystem.Draw();
+    {
+        using var theme = LedgerTheme.Push();
+        _windowSystem.Draw();
+    }
 }
